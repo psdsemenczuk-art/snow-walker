@@ -1,0 +1,267 @@
+// ── editor.js — UI logic for the engine editor panel ────────────────────────
+'use strict';
+
+// Current config (will be populated from main process)
+window.cfg = {
+  walkSpeed: 4.5,
+  runSpeed: 9.0,
+  mouseSensitivity: 2.2,
+  fov: 72,
+  fogDensity: 0.020,
+  snowIntensity: 3500,
+  skyColor: '#c8ddf0',
+  assets: {
+    terrain: null,
+    trees: [],
+    bushes: [],
+    stumps: [],
+    misc: []
+  },
+  scatter: {
+    treeCount: 110, treeMinDist: 12, treeMaxDist: 130, treeMinScale: 6, treeMaxScale: 10,
+    bushCount: 80,  bushMinDist: 8,  bushMaxDist: 120, bushMinScale: 0.5, bushMaxScale: 1.5,
+    stumpCount: 40, stumpMinDist: 10, stumpMaxDist: 100, stumpScale: 0.6,
+    miscCount: 20,  miscMaxDist: 100
+  }
+};
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const tab = btn.dataset.tab;
+    document.getElementById('tab-settings').style.display = tab === 'settings' ? '' : 'none';
+    document.getElementById('tab-assets').style.display   = tab === 'assets'   ? '' : 'none';
+    document.getElementById('tab-scatter').style.display  = tab === 'scatter'  ? '' : 'none';
+  });
+});
+
+// ── Slider bindings ───────────────────────────────────────────────────────────
+const sliders = [
+  { id: 'walkSpeed',       key: 'walkSpeed',       fmt: v => v.toFixed(1) },
+  { id: 'runSpeed',        key: 'runSpeed',        fmt: v => v.toFixed(1) },
+  { id: 'mouseSensitivity',key: 'mouseSensitivity',fmt: v => v.toFixed(1) },
+  { id: 'fov',             key: 'fov',             fmt: v => v.toFixed(0) + '°' },
+  { id: 'fogDensity',      key: 'fogDensity',      fmt: v => v.toFixed(3) },
+  { id: 'snowIntensity',   key: 'snowIntensity',   fmt: v => Math.round(v) },
+];
+
+sliders.forEach(({ id, key, fmt }) => {
+  const slider = document.getElementById('s-' + id);
+  const valEl  = document.getElementById('v-' + id);
+  slider.addEventListener('input', () => {
+    const v = parseFloat(slider.value);
+    cfg[key] = v;
+    valEl.textContent = fmt(v);
+    window.gameApplyConfig && window.gameApplyConfig();
+  });
+});
+
+document.getElementById('s-skyColor').addEventListener('input', e => {
+  cfg.skyColor = e.target.value;
+  window.gameApplyConfig && window.gameApplyConfig();
+});
+
+// ── Scatter inputs ────────────────────────────────────────────────────────────
+const scatterInputs = [
+  'treeCount','treeMinDist','treeMaxDist','treeMinScale','treeMaxScale',
+  'bushCount','bushMinDist','bushMaxDist','bushMinScale','bushMaxScale',
+  'stumpCount','stumpMinDist','stumpMaxDist','stumpScale',
+  'miscCount','miscMaxDist'
+];
+scatterInputs.forEach(key => {
+  const el = document.getElementById('sc-' + key);
+  if (el) el.addEventListener('change', () => {
+    cfg.scatter[key] = parseFloat(el.value);
+  });
+});
+
+// ── Load config from main process ─────────────────────────────────────────────
+async function loadConfig() {
+  if (!window.engine) return;
+  const saved = await window.engine.getConfig();
+  if (!saved) return;
+  Object.assign(cfg, saved);
+  if (!cfg.scatter) cfg.scatter = window.cfg.scatter;
+  if (!cfg.assets)  cfg.assets  = { terrain:null, trees:[], bushes:[], stumps:[], misc:[] };
+
+  // Apply to sliders
+  sliders.forEach(({ id, key, fmt }) => {
+    const slider = document.getElementById('s-' + id);
+    const valEl  = document.getElementById('v-' + id);
+    if (slider && cfg[key] !== undefined) {
+      slider.value = cfg[key];
+      valEl.textContent = fmt(parseFloat(cfg[key]));
+    }
+  });
+  document.getElementById('s-skyColor').value = cfg.skyColor || '#c8ddf0';
+
+  scatterInputs.forEach(key => {
+    const el = document.getElementById('sc-' + key);
+    if (el && cfg.scatter && cfg.scatter[key] !== undefined) el.value = cfg.scatter[key];
+  });
+
+  // Render asset slots
+  renderAllSlots();
+}
+
+// ── Save / Reset ──────────────────────────────────────────────────────────────
+document.getElementById('btn-save').addEventListener('click', async () => {
+  if (window.engine) await window.engine.saveConfig(cfg);
+  setStatus('Settings saved', true);
+  setTimeout(() => setStatus('Ready'), 2000);
+});
+
+document.getElementById('btn-reset').addEventListener('click', async () => {
+  if (window.engine) {
+    const def = await window.engine.resetConfig();
+    Object.assign(cfg, def);
+    loadConfig();
+  }
+  setStatus('Reset to defaults', false);
+  setTimeout(() => setStatus('Ready'), 2000);
+});
+
+document.getElementById('btn-reload').addEventListener('click', () => {
+  window.gameRebuildScene && window.gameRebuildScene();
+});
+document.getElementById('btn-scatter-apply').addEventListener('click', () => {
+  window.gameRebuildScene && window.gameRebuildScene();
+});
+
+// ── Asset slots ───────────────────────────────────────────────────────────────
+const SLOTS = ['terrain','trees','bushes','stumps','misc'];
+
+function isMulti(slot) { return slot !== 'terrain'; }
+
+function renderSlot(slot) {
+  const filesEl = document.getElementById('files-' + slot);
+  const badgeEl = document.getElementById('badge-' + slot);
+  const paths = isMulti(slot) ? (cfg.assets[slot] || []) : (cfg.assets[slot] ? [cfg.assets[slot]] : []);
+
+  filesEl.innerHTML = '';
+  if (paths.length === 0) {
+    badgeEl.textContent = 'Empty';
+    badgeEl.className = 'slot-badge';
+    return;
+  }
+  badgeEl.textContent = paths.length + ' file' + (paths.length > 1 ? 's' : '');
+  badgeEl.className = 'slot-badge loaded';
+
+  paths.forEach((p, idx) => {
+    const name = p.split(/[\\/]/).pop();
+    const row = document.createElement('div');
+    row.className = 'slot-file-item';
+    row.innerHTML = `<span class="fname" title="${p}">${name}</span><button class="remove-btn" data-slot="${slot}" data-idx="${idx}">×</button>`;
+    filesEl.appendChild(row);
+  });
+}
+
+function renderAllSlots() {
+  SLOTS.forEach(renderSlot);
+  updateAssetStatus();
+}
+
+document.addEventListener('click', e => {
+  if (e.target.classList.contains('remove-btn')) {
+    const slot = e.target.dataset.slot;
+    const idx  = parseInt(e.target.dataset.idx);
+    if (isMulti(slot)) {
+      cfg.assets[slot].splice(idx, 1);
+    } else {
+      cfg.assets[slot] = null;
+    }
+    renderSlot(slot);
+    updateAssetStatus();
+  }
+});
+
+// Click to pick file
+SLOTS.forEach(slot => {
+  const el = document.getElementById('slot-' + slot);
+  el.addEventListener('click', async e => {
+    if (e.target.classList.contains('remove-btn')) return;
+    if (!window.engine) return;
+    const paths = await window.engine.pickAssetFile(slot);
+    if (!paths) return;
+    if (isMulti(slot)) {
+      cfg.assets[slot] = [...(cfg.assets[slot] || []), ...paths];
+    } else {
+      cfg.assets[slot] = paths[0];
+    }
+    renderSlot(slot);
+    updateAssetStatus();
+  });
+});
+
+// Drag & drop onto slots
+SLOTS.forEach(slot => {
+  const el = document.getElementById('slot-' + slot);
+
+  el.addEventListener('dragover', e => {
+    e.preventDefault();
+    el.classList.add('dragover');
+  });
+  el.addEventListener('dragleave', () => el.classList.remove('dragover'));
+  el.addEventListener('drop', async e => {
+    e.preventDefault();
+    el.classList.remove('dragover');
+    const files = [...e.dataTransfer.files].filter(f => /\.glb$/i.test(f.name));
+    if (!files.length) return;
+    const paths = files.map(f => f.path); // Electron gives .path for local files
+    if (isMulti(slot)) {
+      cfg.assets[slot] = [...(cfg.assets[slot] || []), ...paths];
+    } else {
+      cfg.assets[slot] = paths[0];
+    }
+    renderSlot(slot);
+    updateAssetStatus();
+  });
+});
+
+// Also allow dropping directly onto the viewport area
+const viewport = document.getElementById('viewport');
+viewport.addEventListener('dragover', e => e.preventDefault());
+viewport.addEventListener('drop', e => {
+  e.preventDefault();
+  const files = [...e.dataTransfer.files].filter(f => /\.glb$/i.test(f.name));
+  files.forEach(f => {
+    const p = f.path;
+    const name = f.name.toLowerCase();
+    if (/terrain|snow|scene|ground/i.test(name)) {
+      cfg.assets.terrain = p;
+    } else if (/tree|pine|oak|spruce/i.test(name)) {
+      cfg.assets.trees = [...(cfg.assets.trees||[]), p];
+    } else if (/bush|shrub|hedge/i.test(name)) {
+      cfg.assets.bushes = [...(cfg.assets.bushes||[]), p];
+    } else if (/stump/i.test(name)) {
+      cfg.assets.stumps = [...(cfg.assets.stumps||[]), p];
+    } else {
+      cfg.assets.misc = [...(cfg.assets.misc||[]), p];
+    }
+  });
+  renderAllSlots();
+  window.gameRebuildScene && window.gameRebuildScene();
+});
+
+// ── Status helpers ────────────────────────────────────────────────────────────
+function setStatus(msg, active) {
+  document.getElementById('status-text').textContent = msg;
+  const dot = document.getElementById('dot-status');
+  dot.className = 'dot' + (active ? '' : ' inactive');
+}
+
+function updateAssetStatus() {
+  const trees   = (cfg.assets.trees   || []).length;
+  const bushes  = (cfg.assets.bushes  || []).length;
+  const stumps  = (cfg.assets.stumps  || []).length;
+  const misc    = (cfg.assets.misc    || []).length;
+  const terrain = cfg.assets.terrain ? 1 : 0;
+  const total   = terrain + trees + bushes + stumps + misc;
+  document.getElementById('status-assets').textContent =
+    total === 0 ? 'No assets loaded' : `${total} asset${total>1?'s':''} loaded`;
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+loadConfig();
